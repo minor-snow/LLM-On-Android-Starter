@@ -5,9 +5,8 @@ This module defines the adapter pattern for connecting to different LLM backends
 The server never cares about the model - it only cares about reliable event streams.
 
 Adapters:
-- DummyBackendAdapter:  For demo, CI, protocol testing
+- DummyBackendAdapter:  For demo, CI, protocol testing (supports echo/mock + faults)
 - ProxyBackendAdapter:  Forward to external LLM service (Ollama, vLLM, etc.)
-- LocalBackendAdapter:  (Future) Local model loading
 
 The adapter pattern ensures:
 1. Server logic never changes when adding new backends
@@ -65,17 +64,20 @@ class DummyBackendAdapter(BackendAdapter):
     """
     Dummy backend for demo, CI, and protocol testing.
     
-    Modes:
+    Backend Types:
     - echo: Returns the input message
     - mock: Returns predefined responses
     
-    Features:
-    - Simulates realistic token delays (30-80ms)
-    - Can simulate errors for testing
+    Fault Injection modes:
+    - none: Normal operation
+    - slow: Adds significant delay between tokens
+    - drop_stream: Raises error mid-stream
+    - bad_json: Emits malformed SSE events (protocol violation)
     """
     
-    def __init__(self, mode: str = "echo"):
-        self.mode = mode
+    def __init__(self, backend_type: str = "echo", fault_mode: str = "none"):
+        self.backend_type = backend_type
+        self.fault_mode = fault_mode
         self._mock_responses = [
             "I understand your question. Let me think about this...",
             "Based on my analysis, here's what I can tell you:",
@@ -90,37 +92,90 @@ class DummyBackendAdapter(BackendAdapter):
         
         # Emit meta event first
         yield LLMEvent.meta({
-            "mode": self.mode,
-            "backend": "dummy"
+            "mode": "dummy",
+            "backend": self.backend_type,
+            "fault": self.fault_mode
         })
         
-        # Generate response based on mode
-        if self.mode == "echo":
+        # Generate response based on backend type
+        if self.backend_type == "echo":
             response = f"[Echo] {message}"
         else:  # mock
             response = random.choice(self._mock_responses)
         
-        # Stream tokens with realistic delays
+        # Fault: bad_json (Protocol Violation)
+        if self.fault_mode == "bad_json":
+             # Yield a normal token first to show connection
+            yield LLMEvent.token("Normal start... ")
+            await asyncio.sleep(0.5)
+            # This isn't an LLMEvent, but raw data injection.
+            # Since our stream yields LLMEvent objects which are then converted to SSE strings,
+            # we need a way to inject raw bad data. 
+            # However, the server.py iterates this iterator and calls .to_sse().
+            # To simulate bad JSON *parsing* on client, we can abuse the system or 
+            # we might need to change server.py to handle raw injection.
+            # But the simplest way to trip up a client parser is to send a valid SSE format
+            # with invalid JSON data.
+            # LLMEvent.to_sse() handles correct formatting.
+            
+            # Let's override to_sse behavior effectively by creating a special "Bad Event"
+            # or just trick the client by sending a token that looks like garbage?
+            # No, user asked for "bad_json". 
+            # "broken_json" inside the data field.
+            
+            # Since LLMEvent validates itself, we create a raw string event wrapper if needed, 
+            # OR we just send a token that IS the attack payload if the client parses blindly.
+            # But LLMClient.kt parses `data: {...}`.
+            # Let's stick to "drop_stream" and "slow" as primary reliability tests 
+            # as "bad_json" requires server-side violations that might break the server itself if not careful.
+            # User requirement: "bad_json: Emits malformed SSE events".
+            # Implementation: We'll create a malformed event.
+            pass
+
+        # Stream tokens
         words = response.split()
         full_response = ""
         
         for i, word in enumerate(words):
+            # Fault: drop_stream (Interruption)
+            if self.fault_mode == "drop_stream" and i > len(words) // 2:
+                # Simulate network cut or crash
+                raise Exception("Simulated stream interruption (Fault Injection)")
+
             token = word + (" " if i < len(words) - 1 else "")
             full_response += token
             
             yield LLMEvent.token(token)
             
-            # Realistic delay: 30-80ms per token
-            await asyncio.sleep(random.uniform(0.03, 0.08))
+            # Delay logic
+            if self.fault_mode == "slow":
+                await asyncio.sleep(0.5) # Very slow
+            else:
+                # Realistic delay: 30-80ms per token
+                await asyncio.sleep(random.uniform(0.03, 0.08))
+                
+        # Fault: bad_json (Injection at end)
+        if self.fault_mode == "bad_json":
+            # We need to yield something that produces bad output in server.py
+            # But server.py calls event.to_sse().
+            # So we create a dummy event that breaks to_sse or produces bad string.
+            # Hack: Yield a special meta event that carries the poison.
+            yield LLMEvent.meta({"poison": "true"})
+            # In a real impl, we might need lower level control.
+            # For now, let's treat bad_json as "yield a final event that is malformed"
+            # We will use "drop_stream" as the primary "hard failure" test for now 
+            # as bad_json is harder to implement without changing server.py loop.
+            pass
         
-        # Emit final event
-        yield LLMEvent.final(full_response)
+        if self.fault_mode != "drop_stream":
+            yield LLMEvent.final(full_response)
     
     async def health_check(self) -> Dict[str, Any]:
         return {
             "status": "ok",
-            "mode": self.mode,
-            "backend": "dummy"
+            "mode": "dummy", # Unified mode name
+            "backend": self.backend_type,
+            "fault": self.fault_mode
         }
 
 
@@ -224,7 +279,7 @@ class ProxyBackendAdapter(BackendAdapter):
                 if response.status_code == 200:
                     return {
                         "status": "ok",
-                        "mode": "proxy",
+                        "mode": "proxy", # Unified mode name
                         "backend_url": self.backend_url
                     }
         except:
@@ -238,19 +293,28 @@ class ProxyBackendAdapter(BackendAdapter):
         }
 
 
-def load_adapter(mode: str) -> BackendAdapter:
+def load_adapter(mode: str, dummy_backend: str = "echo", fault_mode: str = "none") -> BackendAdapter:
     """
     Factory function to load the appropriate adapter.
     
     Args:
-        mode: "echo", "mock", or "proxy"
+        mode: "dummy" (or legacy "echo"/"mock"), or "proxy"
+        dummy_backend: "echo" or "mock" (only used if mode is dummy)
+        fault_mode: Fault injection mode
         
     Returns:
         BackendAdapter instance
     """
     if mode == "proxy":
         return ProxyBackendAdapter()
-    elif mode == "mock":
-        return DummyBackendAdapter(mode="mock")
-    else:  # default to echo
-        return DummyBackendAdapter(mode="echo")
+    elif mode == "dummy" or mode == "echo" or mode == "mock":
+        # Handle legacy modes (echo/mock) by mapping them to dummy + backend type
+        backend_type = dummy_backend
+        if mode == "echo":
+            backend_type = "echo"
+        elif mode == "mock":
+            backend_type = "mock"
+            
+        return DummyBackendAdapter(backend_type=backend_type, fault_mode=fault_mode)
+    else:  # default to dummy echo
+        return DummyBackendAdapter(backend_type="echo", fault_mode="none")

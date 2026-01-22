@@ -60,37 +60,56 @@ Future versions may introduce additional transports (e.g. WebSocket, gRPC) witho
 
 ### 1. Start Server / 启动服务端
 
+Choose a mode to start the server. / 选择一种模式启动服务端。
+
+#### Option A: Dummy Mode (Recommended for testing) / Dummy 模式 (推荐)
+
+Works immediately. No real LLM required. / 无需显卡，立刻可用。
+
 ```bash
 cd python-server
 pip install -r requirements.txt
-python server.py --mode echo
+python server.py --mode dummy
 ```
 
-**Expected Output / 预期输出:**
+#### Option B: Proxy Mode (Connect to LLM) / Proxy 模式 (连接真实 LLM)
 
+Connects to Ollama, vLLM, or OpenAI-compatible servers. / 连接到 Ollama 等真实后端。
+
+**Windows (PowerShell):**
+
+```powershell
+$env:LLM_BACKEND_URL="http://localhost:11434"
+python server.py --mode proxy
 ```
-╔══════════════════════════════════════════════════════════╗
-║       LLM-On-Android-Starter Server v1.0                 ║
-╠══════════════════════════════════════════════════════════╣
-║  Mode:    echo                                           ║
-║  Port:    8000                                           ║
-...
-```
 
-**Modes / 可用模式:**
-
-- `--mode echo` - Echo mode (Default). Returns input as output. <br> 回声模式（默认），原样返回输入。
-- `--mode mock` - Mock mode. Returns simulated LLM responses. <br> 模拟响应模式，返回预设的 LLM 回复。
-- `--mode proxy` - Proxy mode. Forwards requests to real LLM backend (e.g., Ollama). <br> 代理模式，转发请求到真实 LLM 服务。
-
-### 2. Configure Android / 配置 Android 连接
-
-- **Emulator / 模拟器**: No config needed. Code uses `10.0.2.2:8000` by default. <br> 无需配置，代码默认使用 `10.0.2.2:8000`。
-- **Real Device / 真机**: Run the following command: <br> 运行以下命令:
+**Mac/Linux:**
 
 ```bash
-adb reverse tcp:8000 tcp:8000
+export LLM_BACKEND_URL=http://localhost:11434
+python server.py --mode proxy
 ```
+
+### 2. Configure Android / 配置 Android
+
+The Android Demo App now supports switching environments directly in the UI.
+<br> Android Demo 现在支持在 UI 中直接切换环境。
+
+#### Method A: Real Device (Recommended) / 真机 (推荐)
+
+1. **Connect Device via USB.** / USB 连接手机。
+2. **Run Port Mapping:** / 执行端口映射:
+
+   ```bash
+   adb reverse tcp:8000 tcp:8000
+   ```
+
+3. **In App:** Select **"Device (adb reverse)"** (Default). / 在 App 中选择 Device (默认)。
+
+#### Method B: Android Emulator / 模拟器
+
+1. **In App:** Select **"Emulator"**. / 在 App 中选择 Emulator。
+2. Additional config is handled automatically by using `10.0.2.2`.
 
 ### 3. Run Demo / 运行 Demo
 
@@ -98,7 +117,36 @@ adb reverse tcp:8000 tcp:8000
 ./gradlew :demo-android:installDebug
 ```
 
-Open App. If you see `✅ Connected (echo, XXms)`, you are ready! <br> 打开 App，看到 `✅ Connected` 即表示连接成功！
+Open App. If you see **"Connected Mode: dummy"**, you are ready!
+<br> 打开 App，看到 **"Connected"** 即表示连接成功！
+
+---
+
+## Troubleshooting / 故障排除
+
+If you cannot connect, check the following checklist:
+<br> 如果无法连接，请检查以下清单：
+
+### Preflight Checklist / 预检查
+
+1. **Is Server Running?**
+   Visit `http://localhost:8000/health` in your PC browser. You should see `{"status":"ok",...}`.
+   <br> 在电脑浏览器访问上述地址，确保返回 JSON。
+2. **Requirements Installed?**  
+   Did you run `pip install -r requirements.txt` inside `python-server/`?
+   <br> 确保在 `python-server/` 目录下安装了依赖。
+3. **ADB Reverse (Real Device Only)**
+   Run `adb reverse --list` to verify mapping.
+   <br> 运行该命令验证端口映射是否存在。
+
+### Common Issues / 常见问题
+
+| Symptom / 症状 | Cause / 原因 | Solution / 解决方案 |
+|-----|------|---------|
+| `Cannot connect to...` | Port not mapped (端口未映射) | Real Device: Run `adb reverse tcp:8000 tcp:8000` |
+| `Connection timed out` | Wrong Endpoint (选错地址) | Switch to "Emulator" in App settings if using Emulator. |
+| `Degraded: Stream interrupted` | Network/Server Drop (断网) | Check your network or server logs. |
+| `Status: Checking...` | Server unreachable (无法连接) | Check if PC and Phone are on same Wifi (if not using USB). |
 
 ---
 
@@ -142,7 +190,7 @@ All LLM responses follow a unified event format: <br> 所有 LLM 响应都遵循
 
 ```kotlin
 // 1. Create Client / 创建客户端
-val client = LLMClient("http://10.0.2.2:8000")
+val client = LLMClient("http://127.0.0.1:8000") // Use 10.0.2.2 for Emulator
 
 // 2. Check Connection (Recommended) / 检查连接 (推荐)
 when (val health = client.healthCheck()) {
@@ -166,45 +214,12 @@ client.chat("Hello").collect { response ->
 ```kotlin
 // Use Config Object / 使用配置对象
 val config = LLMClientConfig(
-    baseUrl = "http://10.0.2.2:8000",
+    baseUrl = "http://127.0.0.1:8000",
     connectTimeoutMs = 5000,
-    readTimeoutMs = 60000,
-    retryPolicy = RetryPolicy(
-        maxRetries = 3,
-        initialDelayMs = 1000,
-        maxDelayMs = 30000
-    )
+    readTimeoutMs = 60000
 )
 val client = LLMClient(config)
 ```
-
----
-
-## Connecting to Real LLM / 连接真实 LLM
-
-Use Proxy Mode to connect to real backends: <br> 通过 Proxy 模式连接真实 LLM：
-
-```bash
-# Connect to Ollama (Local) / 连接到 Ollama
-export LLM_BACKEND_URL=http://localhost:11434
-python server.py --mode proxy
-
-# Connect to OpenAI-compatible API / 连接到 OpenAI 兼容接口
-export LLM_BACKEND_URL=http://your-api-server:8080
-export LLM_MODEL=gpt-4
-python server.py --mode proxy
-```
-
----
-
-## Troubleshooting / 故障排除
-
-| Symptom / 症状 | Cause / 原因 | Solution / 解决方案 |
-|-----|------|---------|
-| `Cannot connect to...` | Port not mapped (端口未映射) | Real Device (真机): `adb reverse tcp:8000 tcp:8000` |
-| `Connection timed out` | Server not running (Server 未启动) | Ensure `python server.py` is running (确认 server 在运行) |
-| `Connection refused` | Firewall (防火墙拦截) | Check firewall settings (检查防火墙) |
-| Emulator fails (模拟器连不上) | Wrong IP (IP 错误) | Use `10.0.2.2` instead of `localhost` (使用 10.0.2.2) |
 
 ---
 
@@ -225,7 +240,7 @@ LLM-On-Android-Starter/
 │
 ├── demo-android/                   # Minimal Demo App
 │   └── dev.llmbridge.demo/
-│       └── MainActivity.kt         # ChatScreen
+│       └── MainActivity.kt         # ChatScreen with Connection State Machine
 │
 ├── python-server/                  # FastAPI Server
 │   ├── server.py                   # Entry Point / 主入口

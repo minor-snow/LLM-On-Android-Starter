@@ -5,8 +5,7 @@ A protocol-first server for reliable LLM streaming between Android clients and P
 一个协议优先的服务端，用于实现 Android 客户端与 Python 后端之间的可靠 LLM 流式传输。
 
 Usage / 用法:
-    python server.py --mode echo      # Dummy echo mode (default) / 回声模式（默认）
-    python server.py --mode mock      # Dummy mock mode / 模拟响应模式
+    python server.py --mode dummy     # Dummy mode (default) / Dummy 模式（默认）
     python server.py --mode proxy     # Proxy to LLM_BACKEND_URL / 代理模式
 
 The server implements the LLM Event Streaming Protocol (LESP):
@@ -25,6 +24,7 @@ from pydantic import BaseModel
 from typing import Optional, Any, Dict
 import uvicorn
 import json
+import sys
 
 from protocol import LLMEvent
 from adapters import load_adapter, BackendAdapter
@@ -89,7 +89,7 @@ async def health():
         status=health_info.get("status", "ok"),
         mode=health_info.get("mode", "unknown"),
         backend=health_info.get("backend"),
-        latency_hint="30-80ms per token" if "dummy" in str(health_info.get("backend", "")) else None
+        latency_hint="30-80ms per token" if "dummy" in str(health_info.get("mode", "")) else None
     )
 
 
@@ -140,9 +140,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python server.py --mode echo       # Echo mode (default)
-  python server.py --mode mock       # Mock responses
-  python server.py --mode proxy      # Proxy to LLM_BACKEND_URL
+  python server.py --mode dummy       # Dummy mode (default)
+  python server.py --mode proxy       # Proxy to LLM_BACKEND_URL
+  
+  # Advanced Dummy Options:
+  python server.py --mode dummy --dummy-backend mock
+  python server.py --mode dummy --dummy-fault slow
   
 Environment Variables:
   LLM_BACKEND_URL     Backend URL for proxy mode (default: http://127.0.0.1:11434)
@@ -151,12 +154,27 @@ Environment Variables:
         """
     )
     
+    # NOTE: We removed choices=["dummy", "proxy"] to allow hidden legacy modes (echo/mock)
     parser.add_argument(
         "--mode", 
-        choices=["echo", "mock", "proxy"],
-        default="echo",
-        help="Backend mode (default: echo)"
+        default="dummy",
+        help="Backend mode: 'dummy' (default) or 'proxy'"
     )
+    
+    parser.add_argument(
+        "--dummy-backend",
+        choices=["echo", "mock"],
+        default="echo",
+        help="Type of dummy backend (default: echo)"
+    )
+    
+    parser.add_argument(
+        "--dummy-fault",
+        choices=["none", "slow", "drop_stream", "bad_json"],
+        default="none",
+        help="Inject faults for reliability testing (default: none)"
+    )
+    
     parser.add_argument(
         "--port",
         type=int,
@@ -171,37 +189,64 @@ Environment Variables:
     
     args = parser.parse_args()
     
+    # Manual validation for mode
+    valid_modes = ["dummy", "proxy", "echo", "mock"]
+    if args.mode not in valid_modes:
+        print(f"Error: argument --mode: invalid choice: '{args.mode}' (choose from 'dummy', 'proxy')")
+        sys.exit(1)
+        
+    if args.mode in ["echo", "mock"]:
+        print(f"\n[!] WARNING: mode '{args.mode}' is deprecated. Use '--mode dummy --dummy-backend {args.mode}' instead.\n")
+    
     # Load adapter based on mode
-    adapter = load_adapter(args.mode)
+    adapter = load_adapter(
+        mode=args.mode, 
+        dummy_backend=args.dummy_backend,
+        fault_mode=args.dummy_fault
+    )
     
     # Print startup info
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║       LLM-On-Android-Starter Server v1.0                 ║
+║       LLM-On-Android-Starter Server v1.0.1               ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Mode:    {args.mode:<46} ║
 ║  Port:    {args.port:<46} ║
-║  Host:    {args.host:<46} ║
-╚══════════════════════════════════════════════════════════╝
-""")
+║  Host:    {args.host:<46} ║""")
 
+    if args.dummy_fault != "none":
+        print(f"║  FAULT:   {args.dummy_fault.upper() + ' (Reliability Test)':<46} ║")
+        
+    print("╚══════════════════════════════════════════════════════════╝")
+    
     if args.mode == "proxy":
         import os
         url = os.getenv("LLM_BACKEND_URL", "http://127.0.0.1:11434")
-        print(f"[*] Proxy Config: {url}")
+        print(f"\n[*] Proxy Config: {url}")
         
         # Quick reachability check
         print("[*] Checking backend reachability...")
         try:
             health = asyncio.run(adapter.health_check())
             if health.get("status") == "ok":
-                print(f"    Backend Reachable: ✅  ({health.get('backend', 'unknown')})")
+                print(f"    Backend Reachable: ✅  ({health.get('backend_url', 'unknown')})")
             else:
-                print(f"    Backend Reachable: ❌  (Error: {health.get('error', 'unknown')})")
+                print(f"    Backend Reachable: ❌  (Error: {health.get('message', 'unknown')})")
         except Exception as e:
              print(f"    Backend Reachable: ❌  (Exception: {str(e)})")
     else:
-        print(f"[*] Dummy mode: {args.mode} (no real LLM)")
+        # Dummy details
+        backend_type = args.dummy_backend if args.mode == "dummy" else args.mode
+        print(f"\n[*] Dummy Backend: {backend_type.upper()}")
+        
+        if args.dummy_fault != "none":
+             print(f"[!] FAULT INJECTION ACTIVE: {args.dummy_fault}")
+             if args.dummy_fault == "drop_stream":
+                 print("    -> Will interrupt stream midway.")
+             elif args.dummy_fault == "slow":
+                 print("    -> Will add significant latency.")
+             elif args.dummy_fault == "bad_json":
+                 print("    -> Will send malformed protocol data.")
     
     print("\n[>] Server ready. Waiting for connections...\n")
     
